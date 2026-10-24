@@ -1,0 +1,280 @@
+name: Build BakaSU (ReSukiSU) + SUSFS 2.3.0 Kernel (OPPO A32/A53 · sm4250 · non-GKI 4.19)
+
+# 说明：
+#   云端编译 OPPO sm4250 (Bengal) Android 12 内核源码 + BakaSU(原 ReSukiSU) v4.2.0-rc3
+#   + 手工移植的 SUSFS 2.3.0（CONFIG_KSU_SUSFS 内联 hook 模式），产出 Image.gz。
+#   内核源码与 defconfig 均为官方 OPPO 源：分支 oppo/sm4250_s_12.1_f19
+#   本仓库只做「拉源码 → 集成 BakaSU → 打 SUSFS 补丁 → 追加配置 → 编译 → 上传 artifact」。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bakasu_ref:
+        description: "BakaSU(ReSukiSU) 版本 (4.19 非 GKI 请保持 v4.2.0-rc3)"
+        required: true
+        default: "v4.2.0-rc3"
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    env:
+      KSRC: kernel/msm-4.19                      # 内核源码工作目录
+      OUT: ${{ github.workspace }}/out           # 编译输出目录
+      KSU_REF: ${{ inputs.bakasu_ref || 'v4.2.0-rc3' }}
+      CLANG_DIR: ${{ github.workspace }}/tc/clang
+      GCC64_DIR: ${{ github.workspace }}/tc/gcc64
+      GCC32_DIR: ${{ github.workspace }}/tc/gcc32
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev zip unzip python3 cpio rsync patch
+
+      - name: Cache toolchains
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: tc
+          key: tc-r383902-gcc49-v1
+
+      - name: Fetch toolchains (clang r383902 = clang 10.0.7 + GNU binutils 4.9)
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          try_clone() {
+            local dir="$1" url="$2" br="${3:-}"
+            rm -rf "$dir"
+            if [ -n "$br" ]; then
+              git clone --depth=1 -b "$br" "$url" "$dir"
+            else
+              git clone --depth=1 "$url" "$dir"
+            fi
+          }
+          # clang 10.0.7 (r383902) —— 与原厂 boot.img 内核编译版本一致，兼容性最好
+          try_clone tc/clang https://github.com/AOSP-10/prebuilts_clang_host_linux-x86_clang-r383902.git 10 \
+            || try_clone tc/clang https://github.com/afaneh-toolchain/prebuilts_clang_host_linux-x86_clang-r383902.git \
+            || try_clone tc/clang https://github.com/DevZillion/clang_r383902.git \
+            || { echo "::error::无法获取 clang r383902 工具链"; exit 1; }
+          # GNU binutils / gcc 4.9 (arm64 与 arm32)
+          try_clone tc/gcc64 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git lineage-19.1 \
+            || { echo "::error::无法获取 aarch64 gcc 4.9 工具链"; exit 1; }
+          try_clone tc/gcc32 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git lineage-19.1 \
+            || { echo "::error::无法获取 arm gcc 4.9 工具链"; exit 1; }
+          echo "--- clang ---"; tc/clang/bin/clang --version | head -n 3
+          echo "--- gcc64 ---"; ls tc/gcc64/bin | head -n 6
+
+      - name: Clone OPPO kernel sources
+        run: |
+          set -e
+          git clone --depth=1 -b oppo/sm4250_s_12.1_f19 \
+            https://github.com/oppo-source/android_kernel_oppo_sm4250.git "$KSRC"
+          # 配套的 vendor 模块与设备树仓库 —— 按 Android 源码树的相对布局叠加
+          git clone --depth=1 -b oppo/sm4250_s_12.1_f19 \
+            https://github.com/oppo-source/android_kernel_modules_and_devicetree_oppo_sm4250.git /tmp/oplus-extra
+          cp -a /tmp/oplus-extra/kernel/msm-4.19/. "$KSRC"/
+          mkdir -p vendor
+          cp -a /tmp/oplus-extra/vendor/. vendor/
+          rm -rf /tmp/oplus-extra
+          echo "--- kernel version ---"
+          head -n 5 "$KSRC/Makefile"
+
+      - name: Integrate BakaSU (ReSukiSU) kernel driver
+        run: |
+          set -e
+          # 完整历史克隆（blob 按需拉取，避免 --depth=1 触发 Kbuild 里的 unshallow，
+          # 同时保证 KSU_VERSION 计算与 git describe 拿到真实 tag）
+          rm -rf "$KSRC/KernelSU"
+          git clone --filter=blob:none https://github.com/ReSukiSU/ReSukiSU.git "$KSRC/KernelSU"
+          git -C "$KSRC/KernelSU" checkout "$KSU_REF"
+
+          cd "$KSRC"
+          # BakaSU 的内核驱动在仓库 kernel/ 目录；drivers/kernelsu 指向它
+          rm -rf drivers/kernelsu
+          ln -sfn ../../KernelSU/kernel drivers/kernelsu
+
+          # drivers/Makefile
+          grep -q 'kernelsu/' drivers/Makefile \
+            || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+
+          # drivers/Kconfig：插到最后一个 endmenu 之前（保持在 "Device Drivers" 菜单内）
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig \
+            || python3 - <<'PY'
+          p = 'drivers/Kconfig'
+          s = open(p, encoding='utf-8').read()
+          idx = s.rfind('endmenu')
+          assert idx != -1, 'drivers/Kconfig 里找不到 endmenu'
+          s = s[:idx] + 'source "drivers/kernelsu/Kconfig"\n\n' + s[idx:]
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+          echo "--- integration check ---"
+          ls -ld drivers/kernelsu
+          tail -n 2 drivers/Makefile
+          grep -n 'kernelsu' drivers/Kconfig
+          git -C KernelSU describe --abbrev=0 --tags || true
+
+      - name: Apply SUSFS 2.3.0 kernel patch (4.19 backport)
+        run: |
+          set -e
+          PATCH="$GITHUB_WORKSPACE/patches/50_add_susfs_in_kernel-4.19-2.3.0.patch"
+          ls -l "$PATCH"
+          cd "$KSRC"
+          if git apply --check "$PATCH"; then
+            git apply --whitespace=nowarn "$PATCH"
+            echo "git apply 成功"
+          else
+            echo "git apply 失败，回退到 patch(1)"
+            patch -p1 --forward --fuzz=0 < "$PATCH"
+          fi
+          echo "--- susfs files ---"
+          ls -l fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          grep -n 'susfs.o' fs/Makefile
+          echo "--- inline hook check (与 inline_hook_check.mk 一致) ---"
+          grep -q 'ksu_handle_setresuid' kernel/sys.c
+          grep -q 'ksu_handle_execveat' fs/exec.c
+          grep -q 'ksu_handle_faccessat' fs/open.c
+          grep -q 'ksu_handle_sys_read' fs/read_write.c
+          grep -q 'ksu_handle_stat' fs/stat.c
+          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c
+          grep -q 'ksu_handle_input_handle_event' drivers/input/input.c
+          ! grep -rqE '\bksu_(vfs_read_hook|input_hook|execveat_hook|init_rc_hook)\b' fs kernel drivers || {
+            echo "::error::发现旧式 KSU hook 符号"; exit 1; }
+
+      - name: Add 4.19 header shims for BakaSU
+        run: |
+          set -e
+          cd "$KSRC"
+          # 4.19 没有 5.4+/5.6+ 才引入的这几个头，BakaSU 里是无条件 include 的
+          make_shim() {   # $1=头文件名 $2=转发目标 $3=include guard
+            local name="$1" target="$2" guard="$3"
+            if [ -f "include/linux/$name" ]; then
+              echo "include/linux/$name 已存在，跳过"
+              return 0
+            fi
+            {
+              echo "/* 4.19 compat shim (CI 自动生成) */"
+              echo "#ifndef $guard"
+              echo "#define $guard"
+              echo "#include $target"
+              echo "#endif"
+            } > "include/linux/$name"
+            echo "已生成 include/linux/$name -> $target"
+          }
+          make_shim pgtable.h   '<asm/pgtable.h>'   _LINUX_PGTABLE_COMPAT_H
+          make_shim minmax.h    '<linux/kernel.h>'  _LINUX_MINMAX_COMPAT_H
+          make_shim hex.h       '<linux/kernel.h>'  _LINUX_HEX_COMPAT_H
+          make_shim unaligned.h '<asm/unaligned.h>' _LINUX_UNALIGNED_COMPAT_H
+
+      - name: Apply performance / compatibility defconfig fragment
+        env:
+          FRAGMENT: |
+            # ==================================================================
+            # 由 CI 追加：BakaSU + SUSFS 2.3.0 集成 + 性能/兼容性调优
+            # Kconfig 规则：后面追加的条目会覆盖前面的
+            # ==================================================================
+
+            # --- BakaSU v4.2.0-rc3（SUSFS 内联 hook 模式，4.19 非 GKI）---
+            CONFIG_KSU=y
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+            CONFIG_KALLSYMS=y
+            CONFIG_KALLSYMS_ALL=y
+
+            # --- SUSFS 子功能 ---
+            CONFIG_KSU_SUSFS_SUS_PATH=y
+            CONFIG_KSU_SUSFS_SUS_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y
+            CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+            CONFIG_KSU_SUSFS_ENABLE_LOG=y
+            CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+            CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+            CONFIG_KSU_SUSFS_SUS_MAP=y
+
+            # --- 兼容性：重编内核会更换模块签名公钥，vendor 分区预置 .ko 会拒载 ---
+            CONFIG_MODULE_SIG_FORCE=n
+
+            # --- 编译期优化：vmlinux 更小、编译更快 ---
+            # CONFIG_DEBUG_INFO is not set
+
+            # --- 运行期开销裁剪 ---
+            # CONFIG_PAGE_OWNER is not set
+            # CONFIG_SCHEDSTATS is not set
+            # CONFIG_DEBUG_LIST is not set
+            # CONFIG_SLUB_DEBUG is not set
+            # CONFIG_KMALLOC_DEBUG is not set
+            # CONFIG_VMALLOC_DEBUG is not set
+            # CONFIG_DUMP_TASKS_MEM is not set
+
+            # --- 网络栈：BBR 拥塞控制 + fq 队列调度 ---
+            CONFIG_TCP_CONG_BBR=y
+            CONFIG_NET_SCH_FQ=y
+            CONFIG_DEFAULT_BBR=y
+
+            # --- 存储：zram 去重 + 快速压缩算法（原 defconfig 已开启，此处重申意图）---
+            CONFIG_ZRAM=y
+            CONFIG_ZRAM_DEDUP=y
+            CONFIG_CRYPTO_ZSTD=y
+            CONFIG_CRYPTO_LZ4=y
+        run: |
+          set -e
+          DEFCONFIG="$KSRC/arch/arm64/configs/vendor/bengal-perf_defconfig"
+          printf '\n%s\n' "$FRAGMENT" >> "$DEFCONFIG"
+          echo "--- fragment tail ---"
+          tail -n 45 "$DEFCONFIG"
+
+      - name: Configure kernel
+        run: |
+          set -e
+          export PATH="$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          MAKE_ARGS=(
+            -C "$KSRC" O="$OUT" ARCH=arm64
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- REAL_CC="$CLANG_DIR/bin/clang"
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          )
+          make "${MAKE_ARGS[@]}" vendor/bengal-perf_defconfig
+          make "${MAKE_ARGS[@]}" olddefconfig
+          echo "--- key configs ---"
+          grep -E '^CONFIG_(KSU|THREAD_INFO_IN_TASK|OVERLAY_FS|KALLSYMS|KALLSYMS_ALL|EXT4_FS|MODULE_SIG_FORCE|DEBUG_INFO|PAGE_OWNER|TCP_CONG_BBR|NET_SCH_FQ|DEFAULT_BBR)=' "$OUT/.config" || true
+          grep -q '^CONFIG_KSU=y'              "$OUT/.config" || { echo "::error::CONFIG_KSU 未生效，BakaSU 集成失败"; exit 1; }
+          grep -q '^CONFIG_KSU_SUSFS=y'        "$OUT/.config" || { echo "::error::CONFIG_KSU_SUSFS 未生效（需 THREAD_INFO_IN_TASK && 64BIT）"; exit 1; }
+          grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' "$OUT/.config" || { echo "::error::THREAD_INFO_IN_TASK 未开启，SUSFS 无法编译"; exit 1; }
+          grep -q '^CONFIG_KALLSYMS_ALL=y'     "$OUT/.config" || { echo "::error::CONFIG_KALLSYMS_ALL 未生效"; exit 1; }
+          grep -q '^CONFIG_OVERLAY_FS=y'       "$OUT/.config" || { echo "::error::CONFIG_OVERLAY_FS 未生效，KSU 依赖它"; exit 1; }
+          grep -q '^CONFIG_EXT4_FS=y'          "$OUT/.config" || { echo "::error::CONFIG_EXT4_FS 未生效"; exit 1; }
+
+      - name: Build Image.gz
+        run: |
+          set -e
+          export PATH="$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          make -C "$KSRC" O="$OUT" ARCH=arm64 \
+            CC=clang CLANG_TRIPLE=aarch64-linux-gnu- REAL_CC="$CLANG_DIR/bin/clang" \
+            CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            -j"$(nproc)" Image.gz
+          echo "--- artifacts ---"
+          ls -l "$OUT/arch/arm64/boot/Image.gz" "$OUT/vmlinux" "$OUT/System.map"
+          echo "--- kernel release ---"
+          strings "$OUT/vmlinux" | grep -m1 'Linux version' || true
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakasu-susfs230-kernel-${{ env.KSU_REF }}
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/vmlinux
+            out/System.map
+          if-no-files-found: error
